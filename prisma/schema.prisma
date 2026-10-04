@@ -1,0 +1,349 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+model Organization {
+  id                  String               @id
+  name                String
+  nit                 String?
+  invimaRegistration  String?              @map("invima_registration")
+  createdAt           DateTime             @default(now()) @map("created_at")
+  users               User[]
+  rawMaterials        RawMaterial[]
+  rawMaterialLots     RawMaterialLot[]
+  masterFormulas      MasterFormula[]
+  productionOrders    ProductionOrder[]
+  batchEvents         BatchEvent[]
+  qcSpecifications    QcSpecification[]
+  qcResults           QcResult[]
+  deviations          Deviation[]
+  finishedProductLots FinishedProductLot[]
+  sops                Sop[]
+  auditLogs           AuditLog[]
+
+  @@map("organizations")
+}
+
+enum Role {
+  operario
+  jefe_planta
+  calidad
+  director_tecnico
+  bodega
+  admin
+}
+
+model User {
+  id         String       @id
+  tenantId   String       @map("tenant_id")
+  fullName   String       @map("full_name")
+  email      String
+  role       Role
+  mfaEnabled Boolean      @default(false) @map("mfa_enabled")
+  active     Boolean      @default(true)
+  tenant     Organization @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId])
+  @@map("users")
+}
+
+enum LotStatus {
+  cuarentena
+  liberado
+  rechazado
+}
+
+model RawMaterial {
+  id          String              @id @default(uuid())
+  tenantId    String              @map("tenant_id")
+  code        String
+  name        String
+  unit        String
+  category    String?
+  tenant      Organization        @relation(fields: [tenantId], references: [id])
+  lots        RawMaterialLot[]
+  ingredients FormulaIngredient[]
+
+  @@unique([tenantId, code])
+  @@map("raw_materials")
+}
+
+model RawMaterialLot {
+  id                   String       @id @default(uuid())
+  tenantId             String       @map("tenant_id")
+  rawMaterialId        String       @map("raw_material_id")
+  supplierLotCode      String       @map("supplier_lot_code")
+  receivedAt           DateTime     @default(now()) @map("received_at")
+  expiryDate           DateTime     @map("expiry_date") @db.Date
+  quantityReceived     Decimal      @map("quantity_received")
+  quantityAvailable    Decimal      @map("quantity_available")
+  status               LotStatus    @default(cuarentena)
+  qrCode               String?      @map("qr_code")
+  supplierProvidedCode String?      @map("supplier_provided_code")
+  coaDocumentUrl       String?      @map("coa_document_url")
+  tenant               Organization @relation(fields: [tenantId], references: [id])
+  rawMaterial          RawMaterial  @relation(fields: [rawMaterialId], references: [id])
+
+  @@index([tenantId, status])
+  @@map("raw_material_lots")
+}
+
+enum FormulaStatus {
+  draft
+  active
+  archived
+}
+
+model MasterFormula {
+  id               String              @id @default(uuid())
+  tenantId         String              @map("tenant_id")
+  code             String
+  name             String
+  version          Int                 @default(1)
+  status           FormulaStatus       @default(draft)
+  productType      String?             @map("product_type")
+  approvedBy       String?             @map("approved_by")
+  approvedAt       DateTime?           @map("approved_at")
+  tenant           Organization        @relation(fields: [tenantId], references: [id])
+  ingredients      FormulaIngredient[]
+  orders           ProductionOrder[]
+  qcSpecifications QcSpecification[]
+
+  @@unique([tenantId, code, version])
+  @@map("master_formulas")
+}
+
+model FormulaIngredient {
+  id            String        @id @default(uuid())
+  formulaId     String        @map("formula_id")
+  rawMaterialId String        @map("raw_material_id")
+  percentage    Decimal       @db.Decimal(6, 3)
+  orderIndex    Int           @map("order_index")
+  formula       MasterFormula @relation(fields: [formulaId], references: [id])
+  rawMaterial   RawMaterial   @relation(fields: [rawMaterialId], references: [id])
+
+  @@map("formula_ingredients")
+}
+
+model ProductionOrder {
+  id              String              @id @default(uuid())
+  tenantId        String              @map("tenant_id")
+  orderNumber     String              @map("order_number")
+  formulaId       String              @map("formula_id")
+  formulaVersion  Int                 @map("formula_version")
+  plannedQuantity Decimal             @map("planned_quantity")
+  status          BatchStatus         @default(planificado)
+  plannedStart    DateTime?           @map("planned_start")
+  actualStart     DateTime?           @map("actual_start")
+  actualEnd       DateTime?           @map("actual_end")
+  createdBy       String              @map("created_by")
+  tenant          Organization        @relation(fields: [tenantId], references: [id])
+  formula         MasterFormula       @relation(fields: [formulaId], references: [id])
+  events          BatchEvent[]
+  signatures      BatchSignature[]
+  deviations      Deviation[]
+  qcResults       QcResult[]
+  finishedLot     FinishedProductLot?
+
+  // Final-review fix (Critical 1): `orderNumber` used to carry a bare,
+  // GLOBAL `@unique`, but `generateOrderNumber` numbers orders consecutively
+  // PER TENANT (`OP-<year>-001`, `-002`, ...). The second tenant's very first
+  // order therefore always collided with the first tenant's `OP-<year>-001`
+  // (P2002) — no tenant after the first could ever create an order. The
+  // uniqueness guarantee is per-tenant, matching `RawMaterial`/
+  // `MasterFormula`/`FinishedProductLot`'s own `@@unique([tenantId, ...])`
+  // keys. Edited directly without `prisma migrate dev` (Task 3 / live DB
+  // still BLOCKED — same precedent as the Deviation fields above); the
+  // migration is generated once a database exists.
+  @@unique([tenantId, orderNumber])
+  @@index([tenantId, status])
+  @@map("production_orders")
+}
+
+enum BatchStatus {
+  planificado
+  pesado
+  mezclado
+  envasado
+  calidad
+  liberado
+  rechazado
+}
+
+model BatchEvent {
+  id                String          @id @default(uuid())
+  tenantId          String          @map("tenant_id")
+  productionOrderId String          @map("production_order_id")
+  eventType         String          @map("event_type")
+  payload           Json
+  actorUserId       String          @map("actor_user_id")
+  occurredAt        DateTime        @map("occurred_at")
+  syncedAt          DateTime        @default(now()) @map("synced_at")
+  clientEventId     String          @unique @map("client_event_id")
+  deviceId          String?         @map("device_id")
+  order             Organization    @relation(fields: [tenantId], references: [id])
+  productionOrder   ProductionOrder @relation(fields: [productionOrderId], references: [id])
+
+  @@index([productionOrderId])
+  @@map("batch_events")
+}
+
+model BatchSignature {
+  id                String          @id @default(uuid())
+  productionOrderId String          @map("production_order_id")
+  stage             String
+  signedBy          String          @map("signed_by")
+  signedAt          DateTime        @default(now()) @map("signed_at")
+  meaningStatement  String          @map("meaning_statement")
+  reauthVerified    Boolean         @map("reauth_verified")
+  order             ProductionOrder @relation(fields: [productionOrderId], references: [id])
+
+  // Review round 1 fix (task 11, Finding 2 — TOCTOU race backstop): two
+  // near-simultaneous `production.sign` calls for the same order+stage could
+  // both pass `advanceStageInternal`'s in-transaction `canTransition` check
+  // before either commits (the app-level fix is `advanceStageInternal`'s
+  // `updateMany({ where: { id, status: from } })` guard in production.ts).
+  // This unique constraint is the database-level backstop: even if the
+  // application guard were ever bypassed or raced in a way the transaction
+  // isolation level doesn't catch, the database itself refuses a second
+  // `BatchSignature` for the same (order, stage) pair.
+  @@unique([productionOrderId, stage])
+  @@map("batch_signatures")
+}
+
+model QcSpecification {
+  id        String        @id @default(uuid())
+  tenantId  String        @map("tenant_id")
+  formulaId String        @map("formula_id")
+  parameter String
+  minValue  Decimal?      @map("min_value")
+  maxValue  Decimal?      @map("max_value")
+  unit      String?
+  tenant    Organization  @relation(fields: [tenantId], references: [id])
+  formula   MasterFormula @relation(fields: [formulaId], references: [id])
+
+  @@index([tenantId])
+  @@map("qc_specifications")
+}
+
+enum QcResultStatus {
+  pass
+  fail
+}
+
+model QcResult {
+  id                String          @id @default(uuid())
+  tenantId          String          @map("tenant_id")
+  productionOrderId String          @map("production_order_id")
+  parameter         String
+  measuredValue     Decimal         @map("measured_value")
+  result            QcResultStatus
+  recordedBy        String          @map("recorded_by")
+  recordedAt        DateTime        @default(now()) @map("recorded_at")
+  tenant            Organization    @relation(fields: [tenantId], references: [id])
+  order             ProductionOrder @relation(fields: [productionOrderId], references: [id])
+
+  @@index([tenantId])
+  @@map("qc_results")
+}
+
+enum DeviationStatus {
+  abierta
+  en_investigacion
+  pendiente_aprobacion
+  cerrada
+}
+
+model Deviation {
+  id                     String          @id @default(uuid())
+  tenantId               String          @map("tenant_id")
+  productionOrderId      String          @map("production_order_id")
+  description            String
+  investigation          String?
+  correctiveAction       String?         @map("corrective_action")
+  status                 DeviationStatus @default(abierta)
+  raisedBy               String          @map("raised_by")
+  // Task 13 review round 1 (user decision: split `investigate` into two
+  // steps for audit-trail granularity): records who started the
+  // investigation and when the `abierta -> en_investigacion` transition
+  // happened, since INVIMA audit review needs that timestamp/actor, not just
+  // the later `pendiente_aprobacion` submission. Nullable/optional the same
+  // way `approvedBy`/`approvedAt` are — set only once `startInvestigation`
+  // runs. Same as `a2146d2`'s precedent (task 11 review round 1's
+  // `@@unique([productionOrderId, stage])`): edited directly in schema.prisma
+  // without running `prisma migrate dev`, since Task 3 (Supabase/RLS, live
+  // DB) remains BLOCKED — the actual migration is deferred until Task 3
+  // unblocks; `prisma generate` (client codegen only, no DB connection
+  // needed) is run instead so the typed Prisma Client used by
+  // `deviations.ts`/tests reflects these fields now.
+  investigationStartedBy String?         @map("investigation_started_by")
+  investigationStartedAt DateTime?       @map("investigation_started_at")
+  approvedBy             String?         @map("approved_by")
+  approvedAt             DateTime?       @map("approved_at")
+  tenant                 Organization    @relation(fields: [tenantId], references: [id])
+  order                  ProductionOrder @relation(fields: [productionOrderId], references: [id])
+
+  @@index([tenantId])
+  @@map("deviations")
+}
+
+model FinishedProductLot {
+  id                String          @id @default(uuid())
+  tenantId          String          @map("tenant_id")
+  productionOrderId String          @unique @map("production_order_id")
+  code              String
+  releasedBy        String?         @map("released_by")
+  releasedAt        DateTime?       @map("released_at")
+  tenant            Organization    @relation(fields: [tenantId], references: [id])
+  order             ProductionOrder @relation(fields: [productionOrderId], references: [id])
+
+  @@unique([tenantId, code])
+  @@map("finished_product_lots")
+}
+
+model Sop {
+  id              String              @id @default(uuid())
+  tenantId        String              @map("tenant_id")
+  code            String
+  title           String
+  fileUrl         String              @map("file_url")
+  version         Int                 @default(1)
+  tenant          Organization        @relation(fields: [tenantId], references: [id])
+  acknowledgments SopAcknowledgment[]
+
+  @@unique([tenantId, code, version])
+  @@map("sops")
+}
+
+model SopAcknowledgment {
+  id     String   @id @default(uuid())
+  sopId  String   @map("sop_id")
+  userId String   @map("user_id")
+  ackAt  DateTime @default(now()) @map("ack_at")
+  sop    Sop      @relation(fields: [sopId], references: [id])
+
+  @@unique([sopId, userId])
+  @@map("sop_acknowledgments")
+}
+
+model AuditLog {
+  id          String       @id @default(uuid())
+  tenantId    String       @map("tenant_id")
+  tableName   String       @map("table_name")
+  recordId    String       @map("record_id")
+  action      String
+  beforeData  Json?        @map("before_data")
+  afterData   Json?        @map("after_data")
+  actorUserId String       @map("actor_user_id")
+  occurredAt  DateTime     @default(now()) @map("occurred_at")
+  tenant      Organization @relation(fields: [tenantId], references: [id])
+
+  @@index([tenantId, tableName])
+  @@map("audit_log")
+}
